@@ -1,0 +1,196 @@
+from flask import Flask
+from flask_restful import Resource, Api
+from flask_apispec import marshal_with, use_kwargs
+from flask_apispec.views import MethodResource
+from apispec import APISpec
+from apispec.ext.marshmallow import MarshmallowPlugin
+from flask_apispec.extension import FlaskApiSpec
+from pymongo import MongoClient
+
+from datetime import datetime
+
+
+app = Flask(__name__)
+api = Api(app)
+docs = FlaskApiSpec(app)
+
+app.config.update(
+    {
+        "APISPEC_SPEC": APISpec(
+            title="Library API",
+            version="v1",
+            plugins=[MarshmallowPlugin()],
+            openapi_version="2.0.0",
+        ),
+        "APISPEC_SWAGGER_URL": "/swagger/",  # URI to access API Doc JSON
+        "APISPEC_SWAGGER_UI_URL": "/swagger-ui/",  # URI to access UI of API Doc
+    }
+)
+
+client = MongoClient(host='mongo',
+                         port=27017, 
+                         username='root', 
+                         password='pass',
+)
+db = client.Library
+
+
+from models import *
+
+
+class Home(MethodResource, Resource):
+    @use_kwargs(DefaultReqSchema)
+    @marshal_with(DefaultRespSchema)  # marshalling
+    def post(self, input):
+        return {"resp": "Hello World"}
+
+
+class GetBooks(MethodResource, Resource):
+    @use_kwargs(
+        BookReqSchema, description='NOTE: rpd_range is in the format of "100-200"'
+    )
+    @marshal_with(BookRespSchema)  # marshalling
+    def post(self, keyword, category, rpd_range):
+        # find all books keyword text in name
+        books = db.Books.find()
+        filter = {}
+        if keyword:
+            filter["name"] = {"$regex": keyword}
+        if category:
+            filter["category"] = category
+        if rpd_range:
+            rpd = rpd.split("-")
+            filter["rpd"] = {"$gte": float(rpd[0]), "$lte": float(rpd[1])}
+
+        books = db.Books.find(filter)
+
+        all_books = []
+        for b in books:
+            book = {}
+            book["name"] = b["name"]
+            book["category"] = b["category"]
+            book["rpd"] = b["rpd"]
+            all_books.append(book)
+        return {"resp": all_books}
+
+
+class IssueBook(MethodResource, Resource):
+    @use_kwargs(BookIssueSchema)
+    @marshal_with(DefaultRespSchema)  # marshalling
+    def post(self, issue_date, book, user):
+        if not db.Books.find_one({"name": book}):
+            return {"message": "Book not found"}
+        db.Transactions.insert_one(
+            {
+                "issue_date": str(issue_date),
+                "book": book,
+                "user": user,
+                "return_date": None,
+            }
+        )
+        return {"resp": f"Book {book} issued to {user}"}
+
+
+class ReturnBook(MethodResource, Resource):
+    @use_kwargs(BookReturnSchema)
+    @marshal_with(DefaultRespSchema)  # marshalling
+    def post(self, return_date, book, user):
+        if not db.Transactions.find_one({"book": book, "user": user}):
+            return {"message": "Invalid book or user name"}
+        db.Transactions.update_one(
+            {"book": book, "user": user}, {"$set": {"return_date": str(return_date)}}
+        )
+        return_date = datetime.strptime(str(return_date), "%Y-%m-%d")
+        issue_date = datetime.strptime(
+            db.Transactions.find_one({"book": book, "user": user})["issue_date"],
+            "%Y-%m-%d",
+        )
+        cost = (
+            abs(return_date - issue_date).days
+            * db.Books.find_one({"name": book})["rpd"]
+        )
+        return {
+            "resp": f"Book {book} returned by {user} and cost to be paid is {cost}"
+        }
+
+
+class GetAllReaders(MethodResource, Resource):
+    @use_kwargs(DefaultReqSchema, description="Enter book name to get all readers")
+    @marshal_with(ReadersListSchema)  # marshalling
+    def post(self, input):
+        bookname=input
+        current_readers = []
+        transactions = db.Transactions.find({"book": bookname})
+        all_readers = []
+        for t in transactions:
+            if not t["return_date"]:
+                current_readers.append(t["user"])
+            all_readers.append(t["user"])
+        all_readers = list(set(all_readers))
+        return {
+            "resp": {"current_readers": current_readers, "all_readers": all_readers}
+        }
+
+
+class TotalRentGenerated(MethodResource, Resource):
+    @use_kwargs(DefaultReqSchema, description='Enter the book name')
+    @marshal_with(DefaultRespSchema)  # marshalling
+    def post(self, input):
+        bookname=input
+        transactions = db.Transactions.find({"book": bookname})
+        total_rent = 0
+        for t in transactions:
+            if t["return_date"]:
+                return_date = datetime.strptime(str(t["return_date"]), "%Y-%m-%d")
+                issue_date = datetime.strptime(str(t["issue_date"]), "%Y-%m-%d")
+                total_rent += (
+                    abs(return_date - issue_date).days
+                    * db.Books.find_one({"name": bookname})["rpd"]
+                )
+        return {"resp": f"Total rent generated by {bookname} is {total_rent}"}
+
+class GetAllBooksIssuedByUser(MethodResource, Resource):
+    @use_kwargs(DefaultReqSchema, description='Enter the user name')
+    @marshal_with(DefaultRespListSchema)  # marshalling
+    def post(self, input):
+        user=input
+        transactions = db.Transactions.find({"user": user})
+        books_issued = []
+        for t in transactions:
+            books_issued.append(t["book"])
+        return {"resp": books_issued}
+
+class GetAllBooksIssuedWithinDate(MethodResource, Resource):
+    @use_kwargs(BooksIssuedWithinDateSchema, description='Enter the date in the format of "YYYY-MM-DD"')
+    @marshal_with(DefaultRespListSchema)  # marshalling
+    def post(self, from_date,to_date):
+        from_date=str(from_date)
+        to_date=str(to_date)
+        transactions = db.Transactions.find({"issue_date": {"$gte": from_date, "$lte": to_date}})
+        books_issued = []
+        for t in transactions:
+            books_issued.append(t["book"])
+        books_issued = list(set(books_issued))
+        return {"resp": books_issued}
+
+api.add_resource(Home, "/")
+api.add_resource(GetBooks, "/getbooks")
+api.add_resource(IssueBook, "/book/issue")
+api.add_resource(ReturnBook, "/book/return")
+api.add_resource(GetAllReaders, "/allreaders")
+api.add_resource(TotalRentGenerated, "/total_rent_by_book")
+api.add_resource(GetAllBooksIssuedByUser, "/book/all_issued_books")
+api.add_resource(GetAllBooksIssuedWithinDate, "/book/all_issued_books_within_date")
+
+docs.register(Home)
+docs.register(GetBooks)
+docs.register(IssueBook)
+docs.register(ReturnBook)
+docs.register(GetAllReaders)
+docs.register(TotalRentGenerated)
+docs.register(GetAllBooksIssuedByUser)
+docs.register(GetAllBooksIssuedWithinDate)
+
+
+if __name__=='__main__':
+    app.run(host="0.0.0.0", port=5000, debug=True)
